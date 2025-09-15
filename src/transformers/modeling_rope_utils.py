@@ -381,6 +381,43 @@ def _compute_longrope_parameters(
 
     return inv_freq, attention_factor
 
+def _compute_unrope_parameters(
+    config: PretrainedConfig, device: "torch.device", seq_len: Optional[int] = None, **rope_kwargs
+) -> tuple["torch.Tensor", float]:
+    """
+    Args:
+        config ([`~transformers.PretrainedConfig`]):
+            The model configuration.
+        device (`torch.device`):
+            The device to use for initialization of the inverse frequencies.
+        seq_len (`int`, *optional*):
+            The current sequence length. Unused for this type of RoPE.
+        rope_kwargs (`Dict`, *optional*):
+            BC compatibility with the previous RoPE class instantiation, will be removed in v4.45.
+    """
+    if config is not None and len(rope_kwargs) > 0:
+        raise ValueError(
+            "Unexpected arguments: `**rope_kwargs` and `config` are mutually exclusive in "
+            f"`_compute_default_rope_parameters`, got `rope_kwargs`={rope_kwargs} and `config`={config}"
+        )
+    if len(rope_kwargs) > 0:
+        base = rope_kwargs["base"]
+        dim = rope_kwargs["dim"]
+    elif config is not None:
+        base = config.rope_theta
+        partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
+        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        dim = int(head_dim * partial_rotary_factor)
+
+    attention_factor = 1.0  # Unused in this type of RoPE
+
+    logstart = math.log(2*math.pi / base)  # 1 cycle in ratio steps
+    logend = math.log(4*math.pi / 4096)  # 2 cycles in 4k steps
+    pos = torch.arange(0, dim//2, device=device) / (dim//2-1)
+    logfreq = pos*(logend-logstart) + logstart
+    inv_freq = logfreq.exp()
+    return inv_freq, attention_factor
+
 
 def _compute_llama3_parameters(
     config: PretrainedConfig, device: "torch.device", seq_len: Optional[int] = None, **rope_kwargs
@@ -435,6 +472,7 @@ ROPE_INIT_FUNCTIONS = {
     "yarn": _compute_yarn_parameters,
     "longrope": _compute_longrope_parameters,
     "llama3": _compute_llama3_parameters,
+    "unrope": _compute_unrope_parameters,
 }
 
 
