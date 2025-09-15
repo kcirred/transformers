@@ -129,10 +129,35 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+
+    # q_embed = (q * cos) + (rotate_half(q) * sin)
+    # k_embed = (k * cos) + (rotate_half(k) * sin)
+
+    dim = cos.shape[-1]
+
+    q_quartile_size = q.shape[-1] // 4
+    q1, q2, q3, q4 = torch.split(q, split_size_or_sections=q_quartile_size, dim=-1)
+    k_quartile_size = k.shape[-1] // 4
+    k1, k2, k3, k4 = torch.split(k, split_size_or_sections=k_quartile_size, dim=-1)
+
+    q_rot = torch.cat((q1, q3), dim=-1)
+    k_rot = torch.cat((k1, k3), dim=-1)
+
+    # print(f"{dim=}, {cos.shape=}, {cos.unsqueeze(unsqueeze_dim).shape=} {q.shape=} {q_rot.shape=}")
+
+    q_rot_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_rot_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+
+    q1_updated, q3_updated = torch.split(q_rot_embed, split_size_or_sections=q_quartile_size, dim=-1)
+    k1_updated, k3_updated = torch.split(k_rot_embed, split_size_or_sections=k_quartile_size, dim=-1)
+
+    q_embed = torch.cat((q1_updated, q2, q3_updated, q4), dim=-1)
+    k_embed = torch.cat((k1_updated, k2, k3_updated, k4), dim=-1)
+
+
     return q_embed, k_embed
 
 
