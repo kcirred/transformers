@@ -505,6 +505,13 @@ def _check_received_keys(
         logger.warning(f"Unrecognized keys in `rope_scaling` for 'rope_type'='{rope_type}': {unused_keys}")
 
 
+def _validate_unrope_rope_parameters(config: PretrainedConfig, ignore_keys: Optional[set] = None):
+    rope_scaling = config.rope_scaling
+    rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "unrope"))  # BC: "rope_type" was originally "type"
+    required_keys = {"rope_type"}
+    received_keys = set(rope_scaling.keys())
+    _check_received_keys(rope_type, received_keys, required_keys, ignore_keys=ignore_keys)
+
 def _validate_default_rope_parameters(config: PretrainedConfig, ignore_keys: Optional[set] = None):
     rope_scaling = config.rope_scaling
     rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", None))  # BC: "rope_type" was originally "type"
@@ -671,6 +678,7 @@ ROPE_VALIDATION_FUNCTIONS = {
     "yarn": _validate_yarn_parameters,
     "longrope": _validate_longrope_parameters,
     "llama3": _validate_llama3_parameters,
+    "unrope": _validate_unrope_rope_parameters,
 }
 
 
