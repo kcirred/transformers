@@ -273,13 +273,16 @@ class LlamaAttention(nn.Module):
         # it is 1 whenever it is a decode
         if cache_kwargs["cache_position"].shape[0] == 1:
             current_position = past_key_value.get_seq_length() + 1
+            pos = torch.ones(1, device=query_states.device, dtype=query_states.dtype).view(1,1,1,1) * current_position
             # print(f'{past_key_value.get_seq_length()=}')
             # print(f'{hidden_states.shape[1]=}')
             # print(f'Decoding token at total position: {current_position=}')
         else:
             current_position = hidden_states.shape[1]
+            pos = torch.arange(current_position, device=query_states.device, dtype=query_states.dtype).view(1,-1,1,1)
             # print(f'prefill {current_position=}')
 
+        query_states = query_states * pos.clamp(min=4096).div(4096).log().div(10).add(1).pow(2)
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -288,7 +291,7 @@ class LlamaAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             # scaling=self.scaling,
-            scaling=self.scaling * (0.1 * math.log(max(current_position, 4096) / 4096) + 1)**2,
+            scaling=self.scaling,
             **kwargs,
         )
 
