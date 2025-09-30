@@ -282,7 +282,7 @@ class LlamaAttention(nn.Module):
             pos = torch.arange(current_position, device=query_states.device, dtype=query_states.dtype).view(1,-1,1,1)
             # print(f'prefill {current_position=}')
 
-        query_states = query_states * pos.clamp(min=4096).div(4096).log().div(10).add(1).pow(2)
+        query_states = query_states * pos.clamp(max=4096).div(4096).log().div(10).add(1).pow(2)
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
