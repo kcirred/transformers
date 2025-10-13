@@ -475,6 +475,8 @@ class DynamicCache(Cache):
         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
         self.key_cache: list[torch.Tensor] = []
         self.value_cache: list[torch.Tensor] = []
+        self.rates_cache: list[torch.Tensor] = []
+        self.affs_cache: list[torch.Tensor] = []
 
         # `_distributed_cache_data` was originally added for compatibility with `torch.distributed` (DDP). See #36121
         # and #36373 for more information. In a nutshell, it is `map(gather_map, zip(*caches))`, i.e. each item in the
@@ -483,9 +485,11 @@ class DynamicCache(Cache):
         # WARNING: `_distributed_cache_data` must be the first argument in `__init__`, otherwise we'll break
         # compatibility. The name of the argument doesn't matter.
         if _distributed_cache_data is not None:
-            for key_states, value_states in _distributed_cache_data:
+            for key_states, value_states, rates_states, affs_states in _distributed_cache_data:
                 self.key_cache.append(key_states)
                 self.value_cache.append(value_states)
+                self.rates_cache.append(rates_states)
+                self.affs_cache.append(affs_states)
 
     def __getitem__(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -493,7 +497,7 @@ class DynamicCache(Cache):
         sequence length.
         """
         if layer_idx < len(self):
-            return (self.key_cache[layer_idx], self.value_cache[layer_idx])
+            return (self.key_cache[layer_idx], self.value_cache[layer_idx], self.rates_cache[layer_idx], self.affs_cache[layer_idx])
         else:
             raise KeyError(f"Cache only has {len(self)} layers, attempted to access layer with index {layer_idx}")
 
@@ -503,7 +507,7 @@ class DynamicCache(Cache):
         keys and values
         """
         for layer_idx in range(len(self)):
-            yield (self.key_cache[layer_idx], self.value_cache[layer_idx])
+            yield (self.key_cache[layer_idx], self.value_cache[layer_idx], self.rates_cache[layer_idx], self.affs_cache[layer_idx])
 
     def __len__(self):
         """
@@ -512,10 +516,15 @@ class DynamicCache(Cache):
         """
         return len(self.key_cache)
 
+    def retrieve(self, layer_idx):
+        return self.key_cache[layer_idx], self.value_cache[layer_idx], self.rates_cache[layer_idx], self.affs_cache[layer_idx]
+
     def update(
         self,
         key_states: torch.Tensor,
         value_states: torch.Tensor,
+        rates_states: torch.Tensor,
+        affs_states: torch.Tensor,
         layer_idx: int,
         cache_kwargs: Optional[dict[str, Any]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -546,18 +555,28 @@ class DynamicCache(Cache):
                 for _ in range(len(self.key_cache), layer_idx):
                     self.key_cache.append(torch.tensor([]))
                     self.value_cache.append(torch.tensor([]))
+                    self.rates_cache.append(torch.tensor([]))
+                    self.affs_cache.append(torch.tensor([]))
                 self.key_cache.append(key_states)
                 self.value_cache.append(value_states)
+                self.rates_cache.append(rates_states)
+                self.affs_cache.append(affs_states)
             elif (
                 not self.key_cache[layer_idx].numel()  # prefers not t.numel() to len(t) == 0 to export the model
             ):  # fills previously skipped layers; checking for tensor causes errors
                 self.key_cache[layer_idx] = key_states
                 self.value_cache[layer_idx] = value_states
+                self.rates_cache[layer_idx] = rates_states
+                self.affs_cache[layer_idx] = affs_states
             else:
                 self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
                 self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
+                print(f'{self.rates_cache[layer_idx].shape=}')
+                print(f'{rates_states.shape=}')
+                self.rates_cache[layer_idx] = torch.cat([self.rates_cache[layer_idx], rates_states], dim=2)
+                self.affs_cache[layer_idx] = torch.cat([self.affs_cache[layer_idx], affs_states], dim=2)
 
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        return self.key_cache[layer_idx], self.value_cache[layer_idx], self.rates_cache[layer_idx], self.affs_cache[layer_idx]
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Returns the sequence length of the cached states. A layer index can be optionally passed."""
@@ -667,6 +686,8 @@ def _flatten_dynamic_cache(
     dictionary = {
         "key_cache": getattr(dynamic_cache, "key_cache"),
         "value_cache": getattr(dynamic_cache, "value_cache"),
+        "rates_cache": getattr(dynamic_cache, "rates_cache"),
+        "affs_cache": getattr(dynamic_cache, "affs_cache"),
     }
     return torch.utils._pytree._dict_flatten(dictionary)
 
@@ -675,6 +696,8 @@ def _flatten_with_keys_dynamic_cache(dynamic_cache: DynamicCache):
     dictionary = {
         "key_cache": getattr(dynamic_cache, "key_cache"),
         "value_cache": getattr(dynamic_cache, "value_cache"),
+        "rates_cache": getattr(dynamic_cache, "rates_cache"),
+        "affs_cache": getattr(dynamic_cache, "affs_cache"),
     }
     return torch.utils._pytree._dict_flatten_with_keys(dictionary)
 
@@ -685,8 +708,8 @@ def _unflatten_dynamic_cache(
 ):
     dictionary = torch.utils._pytree._dict_unflatten(values, context)
     cache = DynamicCache()
-    for k, v in dictionary.items():
-        setattr(cache, k, v)
+    for k, v, r, a in dictionary.items():
+        setattr(cache, k, v, r, a)
     return cache
 
 
@@ -694,6 +717,8 @@ def _flatten_dynamic_cache_for_fx(cache, spec):
     dictionary = {
         "key_cache": getattr(cache, "key_cache"),
         "value_cache": getattr(cache, "value_cache"),
+        "rates_cache": getattr(dynamic_cache, "rates_cache"),
+        "affs_cache": getattr(dynamic_cache, "affs_cache"),
     }
     return torch.fx._pytree._dict_flatten_spec(dictionary, spec)
 

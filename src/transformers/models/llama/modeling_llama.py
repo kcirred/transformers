@@ -22,6 +22,8 @@ from typing import Callable, Optional, Union
 import torch
 import torch.utils.checkpoint
 from torch import nn
+from torch.nn import functional as F
+import math
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
@@ -129,10 +131,35 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+
+    # q_embed = (q * cos) + (rotate_half(q) * sin)
+    # k_embed = (k * cos) + (rotate_half(k) * sin)
+
+    dim = cos.shape[-1]
+
+    q_quartile_size = q.shape[-1] // 4
+    q1, q2, q3, q4 = torch.split(q, split_size_or_sections=q_quartile_size, dim=-1)
+    k_quartile_size = k.shape[-1] // 4
+    k1, k2, k3, k4 = torch.split(k, split_size_or_sections=k_quartile_size, dim=-1)
+
+    q_rot = torch.cat((q1, q3), dim=-1)
+    k_rot = torch.cat((k1, k3), dim=-1)
+
+    # print(f"{dim=}, {cos.shape=}, {cos.unsqueeze(unsqueeze_dim).shape=} {q.shape=} {q_rot.shape=}")
+
+    q_rot_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_rot_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+
+    q1_updated, q3_updated = torch.split(q_rot_embed, split_size_or_sections=q_quartile_size, dim=-1)
+    k1_updated, k3_updated = torch.split(k_rot_embed, split_size_or_sections=k_quartile_size, dim=-1)
+
+    q_embed = torch.cat((q1_updated, q2, q3_updated, q4), dim=-1)
+    k_embed = torch.cat((k1_updated, k2, k3_updated, k4), dim=-1)
+
+
     return q_embed, k_embed
 
 
@@ -202,6 +229,8 @@ class LlamaAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
+        self.static_max = math.log(0.1) # any issues with just initializing this with this value?
+        self.static_min = math.log(0.001) # any issues with just initializing this with this value?
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
@@ -215,6 +244,10 @@ class LlamaAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
+        self.wstatic = nn.Linear(config.hidden_size, config.num_key_value_heads*2, bias=True)
+        self.wstatic.bias.data.zero_()
+        self.register_buffer("staticb", torch.empty(config.num_key_value_heads*2))
+        self.staticb = torch.rand_like(self.staticb) * (self.static_max - self.static_min) + self.static_min
 
     def forward(
         self,
@@ -227,10 +260,28 @@ class LlamaAttention(nn.Module):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
+        print("#### ATTENTION FORWARD ####")
+
+        batch_size, q_len, _ = hidden_states.size()
+        print(f'{hidden_states.shape=}')
+        print(f'{self.wstatic.weight.shape=}')
+        print(f'{self.staticb.shape=}')
+        print(f'{(math.sqrt(self.config.hidden_size))=}')
+        print(f'{self.wstatic.bias.shape=}')
+
+        static = F.linear(hidden_states, self.wstatic.weight, self.staticb + self.wstatic.bias * math.sqrt(self.config.hidden_size))
+        static = static.sigmoid().view(batch_size, q_len, 2, self.config.num_key_value_heads).permute(2,0,3,1)  # 2 b h l is this permutation needed?
+        static_src = static[0]  # b h l
+        static_dest = static[1]  # b h l
+        print(f'{static_src.shape=} b h l')
+        print(f'{static_dest.shape=} b h l')
 
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        # Normalize keys
+        key_states = key_states / key_states.pow(2).sum(-1, True).sqrt().add(1e-6)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -238,27 +289,120 @@ class LlamaAttention(nn.Module):
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
+        # attention_interface: Callable = eager_attention_forward
+        # if self.config._attn_implementation != "eager":
+        #     attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        # attn_output, attn_weights = attention_interface(
+        #     self,
+        #     query_states,
+        #     key_states,
+        #     value_states,
+        #     attention_mask,
+        #     dropout=0.0 if not self.training else self.attention_dropout,
+        #     scaling=self.scaling,
+        #     **kwargs,
+        # )
+
+
+        if cache_kwargs["cache_position"].shape[0] == 1:
+            print(f"#### DECODE #### {self.layer_idx}")
+            if past_key_value is not None:
+                key_states_p, value_states_p, rates_states_p, affs_states_p = past_key_value.retrieve(self.layer_idx)
+                print(f'Retrieved {key_states_p.shape=}, {value_states_p.shape=}. {rates_states_p.shape=} {affs_states_p.shape=}')
+            # Iterative universal attention
+            assert q_len == 1, "UA decoding not currently supported for more than 1 token"
+            # thresh = math.log(1e-4)
+            print(f'no squeeze {key_states.shape=} b h l d')
+            print(f'no squeeze {value_states.shape=} b h l d')
+            key_states_bhd = key_states.squeeze(2) # b h d
+            value_states_bhd = value_states.squeeze(2) # b h d
+            print(f'{key_states_bhd.shape=} b h d')
+            print(f'{value_states_bhd.shape=} b h d')
+            print(f'prior to view {query_states.shape=}')
+            query_states = query_states.view(batch_size, self.config.num_key_value_heads, -1, self.head_dim)  # b h r d
+            print(f'{query_states.shape=} b h r d')
+            static_src = static_src.squeeze(2)  # b h
+            static_dest = static_dest.squeeze(2)  # b h
+            print(f'{static_src.shape=} b h')
+            print(f'{static_dest.shape=} b h')
+
+
+            key_states = torch.cat((key_states_p, key_states_bhd.unsqueeze(2)), dim=2)
+            value_states = torch.cat((value_states_p, value_states_bhd.unsqueeze(2)), dim=2)
+
+            # q/k/k products
+            qkkk = key_states.matmul(torch.cat([query_states,key_states_bhd.unsqueeze(2)], dim=2).transpose(-1,-2))  # b h l+1 r+1
+            print(f'{qkkk.shape=}  b h l+1 r+1 r is the number of q heads per kv_head')
+            qk = qkkk[...,:-1]  # b h l+1 r
+            kk = qkkk[:,:,:-1,-1]  # b h l
+            print(f'{qk.shape=} b h l+1 r')
+            print(f'{kk.shape=} b h l')
+
+            # Calculate decays
+            decay = kk.relu().float().pow(2)
+            decay = (decay * rates_states_p * static_dest.unsqueeze(-1)).pow(1/3)
+            decay = torch.log1p(decay.clamp(min=0, max=1-1e-6).neg())
+            print(f'{decay.shape=}')
+
+            affs_states_p = affs_states_p + decay
+            print(f'{affs_states_p.shape=}')
+
+            # Update r/a cache
+            rates_states = static_src.unsqueeze(2)
+            affs_states = torch.zeros(batch_size, self.config.num_key_value_heads, 1, device=affs_states_p.device, dtype=affs_states_p.dtype)
+            print(f'{rates_states.shape=}')
+            print(f'{affs_states.shape=}')
+
+            # rates_states = torch.cat((rates_states_p, static_src.unsqueeze(2)), dim=2)
+            print(f'{rates_states.shape=}')
+            print(f'{affs_states.shape=}')
+            print(f'{qk.shape=}')
+            print(f'{value_states.shape=}')
+            # affs_states = torch.cat((affs_states_p, torch.zeros(batch_size, self.config.num_key_value_heads, 1, device=affs_states_p.device, dtype=affs_states_p.dtype)), dim=2)
+
+            # Perform scaled attention
+            attn_output = qk.float().add(affs_states.unsqueeze(-1)).softmax(dim=2).to(dtype=value_states.dtype).transpose(-1,-2).matmul(value_states)  # b h r d
+            print(f"{attn_output.shape=} b h r d")
+            key_states, value_states, rates_states, affs_states = past_key_value.update(key_states_bhd.unsqueeze(2), value_states_bhd.unsqueeze(2), rates_states, torch.zeros(batch_size, self.config.num_key_value_heads, 1, device=affs_states_p.device, dtype=affs_states_p.dtype), self.layer_idx, cache_kwargs)
+
+        else:
+            print(f"#### PREFILL #### {self.layer_idx}")
+            # Blockwise universal attention
+            rates_states = static_src
+
+            r = self.config.num_attention_heads // self.config.num_key_value_heads
+            mask = self._gen_affinity_scores(key_states, static_src, static_dest, r)  # b h l_q = sequence length l_k = sequence length
+            print(f'{mask.shape=}')
+            torch.backends.cuda.enable_math_sdp(False)
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                torch.repeat_interleave(key_states,r,dim=1),
+                torch.repeat_interleave(value_states,r,dim=1),
+                attn_mask=mask,
+                scale=1,
+            )  # b h l d
+            print(f'{attn_output.shape=} b h l d')
+            attn_output = attn_output.transpose(1,2).contiguous()  # b l h d
+            print(f'{attn_output.shape=} b l h d')
+            affs_states = mask.view(batch_size, self.config.num_key_value_heads, -1, mask.size(-2), mask.size(-1))[:,:,0,-1]
+            key_states, value_states, rates_states, affs_states = past_key_value.update(key_states, value_states, rates_states, affs_states, self.layer_idx, cache_kwargs)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        print(f'{attn_output.shape=} after reshape')
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        print(f'{attn_output.shape=} before return')
+        return attn_output, None
 
+    @torch.compile
+    def _gen_affinity_scores(self, k, src, dest, r):
+        affinity = torch.einsum('bnqh, bnkh -> bnqk', k*src.sqrt().unsqueeze(-1), k*dest.sqrt().unsqueeze(-1)).relu().float().pow(2/3)
+        affinity = torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
+        affinity = affinity.triu(1).cumsum(3).to(dtype=k.dtype)
+        affinity = affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).tril(-1), -1e12).transpose(-1, -2)
+        return torch.repeat_interleave(affinity,r,dim=1)
 
 class LlamaDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: LlamaConfig, layer_idx: int):
@@ -388,6 +532,7 @@ class LlamaModel(LlamaPreTrainedModel):
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
+        print(f'{input_ids=}')
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
