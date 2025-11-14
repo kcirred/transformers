@@ -153,22 +153,23 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     dim = cos.shape[-1]
 
     x = q.shape[-1] / 2
-    f = .25
-    q1, q2, q3, q4 = torch.split(q, [f *x, (1-f) *x, f*x, (1-f)*x], dim=-1)
-    k1, k2, k3, k4 = torch.split(k, [f *x, (1-f) *x, f*x, (1-f)*x], dim=-1)
+    f = .875
+    print([int(f *x), int((1-f) *x), int(f*x), int((1-f)*x)])
+    q1, q2, q3, q4 = torch.split(q, [int(f *x), int((1-f) *x), int(f*x), int((1-f)*x)], dim=-1)
+    k1, k2, k3, k4 = torch.split(k, [int(f *x), int((1-f) *x), int(f*x), int((1-f)*x)], dim=-1)
 
     q_rot = torch.cat((q1, q3), dim=-1)
     k_rot = torch.cat((k1, k3), dim=-1)
 
     # print(f"{dim=}, {cos.shape=}, {cos.unsqueeze(unsqueeze_dim).shape=} {q.shape=} {q_rot.shape=}")
-    cos_adj = cos[..., : 2*x*f]
-    sin_adj = sin[..., : 2*x*f]
+    cos_adj = cos[..., : int(2*x*f)]
+    sin_adj = sin[..., : int(2*x*f)]
 
     q_rot_embed = (q_rot * cos_adj) + (rotate_half(q_rot) * sin_adj)
     k_rot_embed = (k_rot * cos_adj) + (rotate_half(k_rot) * sin_adj)
 
-    q1_updated, q3_updated = torch.split(q_rot_embed, x*f, dim=-1)
-    k1_updated, k3_updated = torch.split(k_rot_embed, x*f, dim=-1)
+    q1_updated, q3_updated = torch.split(q_rot_embed, int(x*f), dim=-1)
+    k1_updated, k3_updated = torch.split(k_rot_embed, int(x*f), dim=-1)
 
     q_embed = torch.cat((q1_updated, q2, q3_updated, q4), dim=-1)
     k_embed = torch.cat((k1_updated, k2, k3_updated, k4), dim=-1)
