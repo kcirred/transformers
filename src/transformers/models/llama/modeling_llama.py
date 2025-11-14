@@ -109,6 +109,13 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
+def rotate_quarter(x):
+    quarter = x.shape[-1] // 4
+    x1 = x[..., :quarter]
+    x2 = x[..., quarter:2*quarter]
+    x_remainder = x[..., 2*quarter:]
+    x_rot = torch.cat((-x2, x1), dim=-1)
+    return torch.cat((x_rot, x_remainder), dim=-1)
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
@@ -137,27 +144,34 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     # q_embed = (q * cos) + (rotate_half(q) * sin)
     # k_embed = (k * cos) + (rotate_half(k) * sin)
 
+    # after permutation first half is cos 2nd half is sin
+    # torch.split(q, [32,32,32,32], dim=-1) 0.5 example
+    # torch.split(q, [16,48,16,48], dim=-1) 0.25 example
+    # torch.split(q, [8,56,8,46], dim=-1) 0.125 example
+
+
     dim = cos.shape[-1]
 
-    q_quartile_size = q.shape[-1] // 4
-    q1, q2, q3, q4 = torch.split(q, split_size_or_sections=q_quartile_size, dim=-1)
-    k_quartile_size = k.shape[-1] // 4
-    k1, k2, k3, k4 = torch.split(k, split_size_or_sections=k_quartile_size, dim=-1)
+    x = q.shape[-1] / 2
+    f = .25
+    q1, q2, q3, q4 = torch.split(q, [f *x, (1-f) *x, f*x, (1-f)*x], dim=-1)
+    k1, k2, k3, k4 = torch.split(k, [f *x, (1-f) *x, f*x, (1-f)*x], dim=-1)
 
     q_rot = torch.cat((q1, q3), dim=-1)
     k_rot = torch.cat((k1, k3), dim=-1)
 
     # print(f"{dim=}, {cos.shape=}, {cos.unsqueeze(unsqueeze_dim).shape=} {q.shape=} {q_rot.shape=}")
+    cos_adj = cos[..., : 2*x*f]
+    sin_adj = sin[..., : 2*x*f]
 
-    q_rot_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_rot_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    q_rot_embed = (q_rot * cos_adj) + (rotate_half(q_rot) * sin_adj)
+    k_rot_embed = (k_rot * cos_adj) + (rotate_half(k_rot) * sin_adj)
 
-    q1_updated, q3_updated = torch.split(q_rot_embed, split_size_or_sections=q_quartile_size, dim=-1)
-    k1_updated, k3_updated = torch.split(k_rot_embed, split_size_or_sections=k_quartile_size, dim=-1)
+    q1_updated, q3_updated = torch.split(q_rot_embed, x*f, dim=-1)
+    k1_updated, k3_updated = torch.split(k_rot_embed, x*f, dim=-1)
 
     q_embed = torch.cat((q1_updated, q2, q3_updated, q4), dim=-1)
     k_embed = torch.cat((k1_updated, k2, k3_updated, k4), dim=-1)
-
 
     return q_embed, k_embed
 
