@@ -412,7 +412,7 @@ def _compute_unrope_parameters(
     attention_factor = 1.0  # Unused in this type of RoPE
 
     logstart = math.log(2*math.pi / base)  # 1 cycle in ratio steps
-    logend = math.log(4*math.pi / 4096)  # 2 cycles in 4k steps
+    logend = math.log(4*math.pi / 131072)  # 2 cycles in 4k steps
     pos = torch.arange(0, dim//2, device=device) / (dim//2-1)
     logfreq = pos*(logend-logstart) + logstart
     inv_freq = logfreq.exp()
