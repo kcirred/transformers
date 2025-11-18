@@ -288,7 +288,7 @@ class LlamaAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             # scaling=self.scaling,
-            scaling=self.scaling * (0.1 * math.log(max(current_position, 4096) / 4096) + 1)**2,
+            scaling=self.scaling * (0.1 * math.log(max(current_position, 4096) / 4096) + 1)**3,
             **kwargs,
         )
 
