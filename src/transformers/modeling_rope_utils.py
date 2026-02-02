@@ -381,6 +381,53 @@ def _compute_longrope_parameters(
 
     return inv_freq, attention_factor
 
+def _compute_yarn128_3b_parameters(
+    config: PretrainedConfig, device: "torch.device", seq_len: Optional[int] = None, **rope_kwargs
+) -> tuple["torch.Tensor", float]:
+    """
+    Computes the inverse frequencies with LongRoPE scaling. Please refer to the
+    [original implementation](https://github.com/microsoft/LongRoPE)
+    Args:
+        config ([`~transformers.PretrainedConfig`]):
+            The model configuration.
+        device (`torch.device`):
+            The device to use for initialization of the inverse frequencies.
+        seq_len (`int`, *optional*):
+            The current sequence length.
+        rope_kwargs (`Dict`, *optional*):
+            BC compatibility with the previous RoPE class instantiation, will be removed in v4.45.
+    Returns:
+        Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+        post-processing scaling factor applied to the computed cos/sin.
+    """
+    # TODO (joao): use the new `original_max_position_embeddings` from rope_scaling
+    # No need to keep BC with longrope, unreleased when this new pattern was created.
+    if len(rope_kwargs) > 0:
+        raise ValueError(
+            "Unexpected arguments: `**rope_kwargs` should be unset in `_compute_longrope_parameters`, got "
+            f"{rope_kwargs}"
+        )
+
+    base = config.rope_theta
+    partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    dim = int(head_dim * partial_rotary_factor)
+    attention_factor = 1.0
+    inv_freq = torch.tensor([1.0000e+00, 8.1462e-01, 6.6360e-01, 5.4058e-01, 4.4037e-01, 3.5873e-01,
+        2.9223e-01, 2.3805e-01, 1.9392e-01, 1.5797e-01, 1.2869e-01, 1.0483e-01,
+        8.5397e-02, 6.9566e-02, 5.6670e-02, 4.3680e-02, 3.3558e-02, 2.5688e-02,
+        1.9583e-02, 1.4859e-02, 1.1213e-02, 8.4081e-03, 6.2579e-03, 4.6160e-03,
+        3.3678e-03, 2.4237e-03, 1.7140e-03, 1.1841e-03, 7.9171e-04, 5.0414e-04,
+        2.9599e-04, 1.4768e-04, 4.4194e-05, 3.6001e-05, 2.9327e-05, 2.3891e-05,
+        1.9462e-05, 1.5854e-05, 1.2915e-05, 1.0521e-05, 8.5703e-06, 6.9815e-06,
+        5.6872e-06, 4.6329e-06, 3.7741e-06, 3.0744e-06, 2.5045e-06, 2.0402e-06,
+        1.6620e-06, 1.3539e-06, 1.1029e-06, 8.9843e-07, 7.3187e-07, 5.9620e-07,
+        4.8567e-07, 3.9564e-07, 3.2229e-07, 2.6255e-07, 2.1387e-07, 1.7423e-07,
+        1.4193e-07, 1.1562e-07, 9.4183e-08, 7.6723e-08], device=device)
+
+    return inv_freq, attention_factor
+
+
 
 def _compute_llama3_parameters(
     config: PretrainedConfig, device: "torch.device", seq_len: Optional[int] = None, **rope_kwargs
@@ -435,6 +482,7 @@ ROPE_INIT_FUNCTIONS = {
     "yarn": _compute_yarn_parameters,
     "longrope": _compute_longrope_parameters,
     "llama3": _compute_llama3_parameters,
+    "3byarn128": _compute_yarn128_3b_parameters,
 }
 
 
@@ -539,6 +587,43 @@ def _validate_yarn_parameters(config: PretrainedConfig, ignore_keys: Optional[se
         )
 
 
+def _validate_yarn128_3b_parameters(config: PretrainedConfig, ignore_keys: Optional[set] = None):
+    rope_scaling = config.rope_scaling
+    rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", None))  # BC: "rope_type" was originally "type"
+    required_keys = {"rope_type", "factor"}
+    optional_keys = {
+        "attention_factor",
+        "beta_fast",
+        "beta_slow",
+        "original_max_position_embeddings",
+        "mscale",
+        "mscale_all_dim",
+    }
+    received_keys = set(rope_scaling.keys())
+    _check_received_keys(rope_type, received_keys, required_keys, optional_keys, ignore_keys=ignore_keys)
+
+    factor = rope_scaling["factor"]
+    if factor is None or not isinstance(factor, float) or factor < 1.0:
+        logger.warning(f"`rope_scaling`'s factor field must be a float >= 1, got {factor}")
+
+    attention_factor = rope_scaling.get("attention_factor")
+    if attention_factor is not None and (not isinstance(attention_factor, float) or attention_factor < 0):
+        logger.warning(
+            f"`rope_scaling`'s attention_factor field must be a float greater than 0, got {attention_factor}"
+        )
+    beta_fast = rope_scaling.get("beta_fast")
+    if beta_fast is not None and not isinstance(beta_fast, float):
+        logger.warning(f"`rope_scaling`'s beta_fast field must be a float, got {beta_fast}")
+    beta_slow = rope_scaling.get("beta_slow")
+    if beta_slow is not None and not isinstance(beta_slow, float):
+        logger.warning(f"`rope_scaling`'s beta_slow field must be a float, got {beta_slow}")
+
+    if (beta_fast or 32) < (beta_slow or 1):
+        logger.warning(
+            f"`rope_scaling`'s beta_fast field must be greater than beta_slow, got beta_fast={beta_fast} "
+            f"(defaults to 32 if None) and beta_slow={beta_slow} (defaults to 1 if None)"
+        )
+
 def _validate_longrope_parameters(config: PretrainedConfig, ignore_keys: Optional[set] = None):
     rope_scaling = config.rope_scaling
     rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", None))  # BC: "rope_type" was originally "type"
@@ -631,6 +716,7 @@ ROPE_VALIDATION_FUNCTIONS = {
     "linear": _validate_linear_scaling_rope_parameters,
     "dynamic": _validate_dynamic_scaling_rope_parameters,
     "yarn": _validate_yarn_parameters,
+    "3byarn128": _validate_yarn128_3b_parameters,
     "longrope": _validate_longrope_parameters,
     "llama3": _validate_llama3_parameters,
 }
